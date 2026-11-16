@@ -1,0 +1,6 @@
+{
+  "name": "LipiWord",
+  "description": "Multilingual handwritten paper to structured Word (.docx) document studio supporting Hindi, Gujarati, Sanskrit, and English.",
+  "requestFramePermissions": ["camera"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
