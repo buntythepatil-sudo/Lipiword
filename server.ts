@@ -2,7 +2,6 @@ import 'dotenv/config';
 import express from 'express';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import { createServer as createViteServer } from 'vite';
 import { GoogleGenAI, Type } from '@google/genai';
 import type {
   LanguageFocus,
@@ -16,16 +15,18 @@ import type {
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-const PORT = 3000;
+const PORT = Number(process.env.PORT) || 3000;
 
-const ai = new GoogleGenAI({
-  apiKey: process.env.GEMINI_API_KEY,
-  httpOptions: {
-    headers: {
-      'User-Agent': 'aistudio-build',
+function getAiClient(): GoogleGenAI {
+  return new GoogleGenAI({
+    apiKey: process.env.GEMINI_API_KEY,
+    httpOptions: {
+      headers: {
+        'User-Agent': 'aistudio-build',
+      },
     },
-  },
-});
+  });
+}
 
 interface TranscribePageInput {
   mimeType: string;
@@ -177,6 +178,10 @@ async function startServer() {
   const app = express();
   app.use(express.json({ limit: '50mb' }));
 
+  app.get('/api/health', (_req, res) => {
+    res.json({ status: 'ok' });
+  });
+
   app.post('/api/transcribe', async (req, res) => {
     try {
       if (!process.env.GEMINI_API_KEY) {
@@ -215,6 +220,7 @@ async function startServer() {
           : 'Transcribe all handwritten content across the provided page image(s) into structured JSON blocks. Preserve original scripts verbatim without translating. Carefully capture every right-side / margin mark in the "marks" field, and group any multiple-choice questions and their options into "mcq" blocks.',
       });
 
+      const ai = getAiClient();
       const response = await ai.models.generateContent({
         model: 'gemini-4-hydrogen',
         contents: { parts },
@@ -230,7 +236,20 @@ async function startServer() {
         return res.status(502).json({ error: 'Empty transcription response received from Gemini Vision.' });
       }
 
-      const parsed = JSON.parse(rawText);
+      const parsed = parseModelJson<{
+        title?: string;
+        subtitle?: string;
+        totalMarks?: string;
+        detectedScripts?: unknown[];
+        blocks?: Record<string, unknown>[];
+      }>(rawText);
+
+      if (!parsed) {
+        console.error('Non-JSON transcription response:', rawText.slice(0, 300));
+        return res.status(502).json({
+          error: 'Transcription returned an unexpected response format. Please try again.',
+        });
+      }
 
       const normalizedBlocks = Array.isArray(parsed.blocks)
         ? parsed.blocks.map((b: Record<string, unknown>, idx: number) => {
@@ -329,6 +348,33 @@ async function startServer() {
     required: ['svg', 'detectedCaption'],
   };
 
+  function parseModelJson<T>(raw: string): T | null {
+    const trimmed = raw.trim();
+    if (!trimmed) return null;
+    try {
+      return JSON.parse(trimmed) as T;
+    } catch {
+      const fenced = trimmed
+        .replace(/^```(?:json)?\s*/i, '')
+        .replace(/\s*```$/i, '')
+        .trim();
+      try {
+        return JSON.parse(fenced) as T;
+      } catch {
+        const firstBrace = fenced.indexOf('{');
+        const lastBrace = fenced.lastIndexOf('}');
+        if (firstBrace !== -1 && lastBrace > firstBrace) {
+          try {
+            return JSON.parse(fenced.slice(firstBrace, lastBrace + 1)) as T;
+          } catch {
+            return null;
+          }
+        }
+        return null;
+      }
+    }
+  }
+
   function sanitizeSvgMarkup(raw: string): string {
     const match = raw.match(/<svg[\s\S]*?<\/svg>/i);
     if (!match) return '';
@@ -381,6 +427,7 @@ async function startServer() {
         '7. Do NOT use <script>, <foreignObject>, <image>, or external URLs.',
       ].join('\n');
 
+      const ai = getAiClient();
       const response = await ai.models.generateContent({
         model: 'gemini-4-hydrogen',
         contents: {
@@ -410,10 +457,17 @@ async function startServer() {
         return res.status(502).json({ error: 'Empty diagram refinement response.' });
       }
 
-      const parsed = JSON.parse(rawText) as {
+      const parsed = parseModelJson<{
         svg?: string;
         detectedCaption?: string;
-      };
+      }>(rawText);
+
+      if (!parsed) {
+        console.error('Non-JSON refine-figure response:', rawText.slice(0, 300));
+        return res.status(502).json({
+          error: 'Diagram refinement returned an unexpected response format. Please try again.',
+        });
+      }
       const cleanSvg = sanitizeSvgMarkup(String(parsed.svg || ''));
       if (!cleanSvg) {
         return res.status(422).json({ error: 'Could not construct a valid vector diagram for this figure.' });
@@ -433,7 +487,31 @@ async function startServer() {
     }
   });
 
+  app.use('/api', (_req, res) => {
+    res.status(404).json({ error: 'API endpoint not found.' });
+  });
+
+  app.use(
+    (
+      err: { status?: number; type?: string; message?: string },
+      req: express.Request,
+      res: express.Response,
+      next: express.NextFunction
+    ) => {
+      if (req.path.startsWith('/api')) {
+        const status = err?.status || (err?.type === 'entity.too.large' ? 413 : 500);
+        const message =
+          err?.type === 'entity.too.large'
+            ? 'Uploaded images exceed the server payload limit. Try fewer or smaller pages.'
+            : err?.message || 'Unexpected server error.';
+        return res.status(status).json({ error: message });
+      }
+      return next(err);
+    }
+  );
+
   if (process.env.NODE_ENV !== 'production') {
+    const { createServer: createViteServer } = await import('vite');
     const vite = await createViteServer({
       server: { middlewareMode: true },
       appType: 'spa',

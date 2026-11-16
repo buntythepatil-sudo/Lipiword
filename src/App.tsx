@@ -115,16 +115,18 @@ async function fileToPaperPage(file: File): Promise<PaperPage> {
     reader.readAsDataURL(file);
   });
 
-  // Downscale only if extremely large (> 2400px) so diacritics stay sharp while upload stays fast
+  // Downscale if > 2200px or > ~1.8MB so diacritics stay sharp while multi-page uploads stay under proxy limits
   const optimizedUrl = await new Promise<string>((resolve) => {
     const img = new Image();
     img.onload = () => {
       const maxDim = 2200;
-      if (img.width <= maxDim && img.height <= maxDim) {
+      const needsResize = img.width > maxDim || img.height > maxDim;
+      const needsCompress = dataUrl.length > 1_800_000;
+      if (!needsResize && !needsCompress) {
         resolve(dataUrl);
         return;
       }
-      const scale = Math.min(maxDim / img.width, maxDim / img.height);
+      const scale = needsResize ? Math.min(maxDim / img.width, maxDim / img.height) : 1;
       const canvas = document.createElement('canvas');
       canvas.width = Math.round(img.width * scale);
       canvas.height = Math.round(img.height * scale);
@@ -133,8 +135,10 @@ async function fileToPaperPage(file: File): Promise<PaperPage> {
         resolve(dataUrl);
         return;
       }
+      ctx.fillStyle = '#FFFFFF';
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
       ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
-      resolve(canvas.toDataURL('image/jpeg', 0.92));
+      resolve(canvas.toDataURL('image/jpeg', 0.88));
     };
     img.onerror = () => resolve(dataUrl);
     img.src = dataUrl;
@@ -177,6 +181,38 @@ async function getOrientedPagePayload(page: PaperPage) {
   });
 
   return { mimeType: 'image/jpeg', data: rotatedDataUrl, name: page.name };
+}
+
+async function parseApiJson<T extends { error?: string }>(
+  res: Response,
+  fallbackError: string
+): Promise<T> {
+  const rawText = await res.text();
+  let parsed: T | null = null;
+  if (rawText) {
+    try {
+      parsed = JSON.parse(rawText) as T;
+    } catch {
+      parsed = null;
+    }
+  }
+
+  if (!res.ok) {
+    if (parsed?.error) {
+      throw new Error(parsed.error);
+    }
+    if (res.status === 413) {
+      throw new Error('Uploaded pages are too large. Try fewer pages or smaller images.');
+    }
+    const snippet = rawText.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 140);
+    throw new Error(snippet ? `${fallbackError} (${res.status}: ${snippet})` : `${fallbackError} (HTTP ${res.status})`);
+  }
+
+  if (!parsed) {
+    throw new Error(`${fallbackError} Server returned an unexpected response. Please try again.`);
+  }
+
+  return parsed;
 }
 
 export default function App() {
@@ -319,10 +355,11 @@ export default function App() {
         }),
       });
 
-      const data = await res.json();
-      if (!res.ok) {
-        throw new Error(data.error || 'Transcription failed.');
-      }
+      const data = await parseApiJson<{
+        meta?: Partial<DocumentMeta>;
+        blocks?: DocumentBlock[];
+        error?: string;
+      }>(res, 'Transcription failed.');
 
       const rawBlocks: DocumentBlock[] = Array.isArray(data.blocks) ? data.blocks : [];
       const croppedBlocks: DocumentBlock[] = await Promise.all(
@@ -481,8 +518,12 @@ export default function App() {
           caption: caption || '',
         }),
       });
-      const data = await res.json();
-      if (!res.ok || !data.svg) {
+      const data = await parseApiJson<{
+        svg?: string;
+        detectedCaption?: string;
+        error?: string;
+      }>(res, 'Failed to refine diagram.');
+      if (!data.svg) {
         throw new Error(data.error || 'Failed to refine diagram.');
       }
       const pngUrl = await renderSvgToHighDpiPng(data.svg);
